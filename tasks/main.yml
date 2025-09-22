@@ -1,45 +1,69 @@
 ---
 - name: Убедиться, что установлен curl
-  apt:
+  ansible.builtin.apt:
     name: curl
     state: present
-#  when: ansible_os_family == 'Debian'
   become: yes
+  when: ansible_os_family == 'Debian'
 
 - name: Скачать манифест MetalLB через curl
-  command: >
+  ansible.builtin.command: >
     curl -fsSL -o /tmp/metallb-native.yaml
     https://raw.githubusercontent.com/metallb/metallb/{{ metallb_version }}/config/manifests/metallb-native.yaml
   args:
-    # Не запускать, если файл уже есть
     creates: /tmp/metallb-native.yaml
 
 - name: Применить манифест MetalLB через kubectl
-  command: kubectl apply -f /tmp/metallb-native.yaml
+  ansible.builtin.command: kubectl apply -f /tmp/metallb-native.yaml
   args:
-    # Идемпотентность: не запускать, если namespace уже есть
     creates: /tmp/.metallb_manifest_applied
   register: kubectl_apply
   changed_when: "'created' in kubectl_apply.stdout or 'configured' in kubectl_apply.stdout"
 
 - name: Отметить, что манифест применён
-  file:
+  ansible.builtin.file:
     path: /tmp/.metallb_manifest_applied
     state: touch
     mode: '0644'
   when: kubectl_apply.changed
 
-#- name: Ожидание создания namespace metallb-system
-#  wait_for:
-#    timeout: 120
-#    delay: 5
-#  register: wait_ns
-#  until: >
-#    (lookup('k8s', cluster_info='namespaces', namespace='metallb-system', kind='Namespace') is defined) or
-#    (wait_ns.elapsed > 120)
+# === ДОБАВЛЕНО: Ожидание регистрации CRD ===
+- name: Ожидание регистрации CRD IPAddressPool
+  kubernetes.core.k8s_info:
+    kind: CustomResourceDefinition
+    name: ipaddresspools.metallb.io
+  register: crd_status
+  until: crd_status.resources | length > 0
+  retries: 20
+  delay: 3
+  ignore_errors: yes
+
+- name: Ожидание регистрации CRD L2Advertisement
+  kubernetes.core.k8s_info:
+    kind: CustomResourceDefinition
+    name: l2advertisements.metallb.io
+  register: crd_status_l2
+  until: crd_status_l2.resources | length > 0
+  retries: 20
+  delay: 3
+  ignore_errors: yes
+# === КОНЕЦ ДОБАВЛЕННОГО ===
+
+- name: Ожидание запуска MetalLB controller
+  kubernetes.core.k8s_info:
+    kind: Pod
+    namespace: metallb-system
+    label_selectors:
+      - "app=metallb,component=controller"
+  register: controller_pods
+  until: >
+    (controller_pods.resources | selectattr('status.phase', 'equalto', 'Running') | list | length) > 0
+  retries: 30
+  delay: 5
 
 - name: Создать IPAddressPool для MetalLB
-  k8s:
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k3s_kubeconfig_path | default(omit) }}"
     state: present
     definition:
       apiVersion: metallb.io/v1beta1
@@ -51,74 +75,66 @@
         addresses:
           - "{{ metallb_ip_range_start }}-{{ metallb_ip_range_end }}"
 
-#- name: Создать L2Advertisement
-#  k8s:
-#    state: present
-#    definition:
-#      apiVersion: metallb.io/v1beta1
-#      kind: L2Advertisement
-#      metadata:
-#        name: default-adv
-#        namespace: metallb-system
-#      spec:
-#        ipAddressPools:
-#          - default-pool
-
-- name: Разрешить общий IP для traefik
-  k8s:
-    state: present
-    definition:
-      apiVersion: v1
-      kind: Service
-      metadata:
-        name: traefik
-        namespace: kube-system
-        annotations:
-          metallb.universe.tf/allow-shared-ip: "true"
-    apply: yes
-
-- name: Создать IPAddressPool для MetalLB
-  k8s:
+- name: Создать L2Advertisement (обязательно для активации выдачи IP!)
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k3s_kubeconfig_path | default(omit) }}"
     state: present
     definition:
       apiVersion: metallb.io/v1beta1
-      kind: IPAddressPool
+      kind: L2Advertisement
       metadata:
-        name: default-pool
+        name: default-adv
         namespace: metallb-system
       spec:
-        addresses:
-          - "{{ metallb_ip_range_start }}-{{ metallb_ip_range_end }}"
+        ipAddressPools:
+          - default-pool
+
+# === Разрешаем совместное использование IP для сервисов ===
 
 - name: Разрешить общий IP для traefik
-  k8s:
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k3s_kubeconfig_path | default(omit) }}"
     state: present
+    kind: Service
+    namespace: kube-system
+    name: traefik
+    merge_type: strategic-merge
     definition:
-      apiVersion: v1
-      kind: Service
       metadata:
-        name: traefik
-        namespace: kube-system
         annotations:
-          metallb.universe.tf/allow-shared-ip: "true"
-    apply: yes
+          metallb.universe.tf/allow-shared-ip: shared-group-1
 
 - name: Разрешить общий IP для immich-nginx-svc
-  k8s:
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k3s_kubeconfig_path | default(omit) }}"
     state: present
+    kind: Service
+    namespace: immich
+    name: immich-nginx-svc
+    merge_type: strategic-merge
     definition:
-      apiVersion: v1
-      kind: Service
       metadata:
-        name: immich-nginx-svc
-        namespace: immich
         annotations:
-          metallb.universe.tf/allow-shared-ip: "true"
-    apply: yes
+          metallb.universe.tf/allow-shared-ip: shared-group-1
 
-- name: Разрешить общий IP для seaweedfs-master (через kubectl patch)
-  command: >
-    kubectl patch svc seaweedfs-master -n seaweed -p '{"metadata": {"annotations": {"metallb.universe.tf/allow-shared-ip": "true"}}}'
-  args:
-    creates: /tmp/.annotation_seaweedfs_master_shared  # чтобы не запускать каждый раз
-  delegate_to: "{{ metallb_ip_host_master }}"
+- name: Проверить существование сервиса seaweedfs-s3
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k3s_kubeconfig_path | default(omit) }}"
+    kind: Service
+    namespace: seaweedfs
+    name: seaweedfs-s3
+  register: s3_svc_exists
+
+- name: Разрешить общий IP для seaweedfs-s3 (в правильном неймспейсе!)
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k3s_kubeconfig_path | default(omit) }}"
+    state: present
+    kind: Service
+    namespace: seaweedfs
+    name: seaweedfs-s3
+    merge_type: strategic-merge
+    definition:
+      metadata:
+        annotations:
+          metallb.universe.tf/allow-shared-ip: shared-group-1
+  when: s3_svc_exists.resources | length > 0
